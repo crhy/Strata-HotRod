@@ -181,6 +181,24 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq256_gu_rows_exact_one(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
         return;
     }
+    // Basalt #575's portable half: its CPU expert kernel is "bit for bit the scalar row", so the engine there
+    // decodes each weight block once for the whole window at EVERY window size.  The same rule's missing case is
+    // ONE-token windows, where #152 still hands the layer to ggml-cpu's per-token dot.  The exact singleton
+    // kernel is bit-identical to that dot on every AVX2 build (ggml's x86 dots for IQ2_XXS, IQ2_XS, IQ2_S,
+    // IQ3_XXS and IQ3_S compile the same AVX2 code whatever AVX-512 ggml has, and iq_avx2_parity fails the
+    // build if one output bit moves), and on an AVX-512 CPU it is FASTER: 7800X3D, native -march=native ggml,
+    // `iq_avx2_parity --bench --dispatch --mb 128 --reps 5` gate/up ms per expert at one token - IQ3_S
+    // 0.275 -> 0.250, IQ3_XXS 0.238 -> 0.225, IQ2_S 0.188 -> 0.167, IQ2_XXS/IQ2_XS 0.174 -> 0.168.  So where
+    // ggml was AVX2-or-better at compile time (its AVX1/SSE dots round differently, #2215), one-token windows
+    // take the kernel.  STRATA_NO_IQ_EXACT1=1 keeps ggml's dot; the env branch above is the same kernel with
+    // an AVX2-only ggml, and where STRATA_IQ_MT_MIN already reaches the multi-token kernel at one token the
+    // multi-token kernel stays (its rows are drafting-independent the other way).
+    static const bool exact1_512 = avx2 && ggml_cpu_has_avx2() && std::getenv("STRATA_NO_IQ_EXACT1") == nullptr;
+    if (exact1_512 && nt == 1 && nt < native_gu_mt_min(f.gu_type) &&
+        (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)) {
+        iq256_gu_rows_exact_one(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
+        return;
+    }
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
